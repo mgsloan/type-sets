@@ -56,13 +56,13 @@ magicTyFamPlugin
     :: String  -- ^ package
     -> String  -- ^ module
     -> String  -- ^ identifier
-    -> ([Type] -> Maybe Type)
+    -> ([Type] -> TcPluginM (Maybe Type))
     -> Plugin
 magicTyFamPlugin p m i f = defaultPlugin
   { tcPlugin = const $ Just $ TcPlugin
       { tcPluginInit = loadTyCon p m i
-      , tcPluginSolve = \cmp_type _ _ w ->
-          TcPluginOk [] <$> solveWanteds f cmp_type w
+      , tcPluginSolve = \familyTyCon _ _ w ->
+          TcPluginOk [] <$> solveWanteds f familyTyCon w
       , tcPluginStop = const $ pure ()
       }
   , pluginRecompile = const $ pure NoForceRecompile
@@ -86,10 +86,15 @@ withStuckSemantics f ts = do
 -- constraints @cts@, and evaluates them via @f@. The result is a set of
 -- 'CNonCanonical' constraints, which should be emitted as the second parameter
 -- of 'TcPluginOk'.
-solveWanteds :: ([Type] -> Maybe Type) -> TyCon -> [Ct] -> TcPluginM [Ct]
+solveWanteds
+  :: ([Type] -> TcPluginM (Maybe Type))
+  -> TyCon
+  -> [Ct]
+  -> TcPluginM [Ct]
 solveWanteds _ _ [] = pure []
-solveWanteds f cmp_type wanted = do
-  let rel = fmap (findRelevant f cmp_type . ctLoc <*> ctev_pred . cc_ev) wanted
+solveWanteds f familyTyCon wanteds = do
+  rel <- for wanteds $ \wanted ->
+    findRelevant f familyTyCon (ctLoc wanted) (ctev_pred (cc_ev wanted))
 
   gs <- for (concat rel) $ \(MagicTyFamResult loc t res) -> do
     let EvExpr ev = evByFiat "magic-tyfams" t res
@@ -100,14 +105,20 @@ solveWanteds f cmp_type wanted = do
 
 ------------------------------------------------------------------------------
 -- | Locate and expand the use of any type families.
-findRelevant :: ([Type] -> Maybe Type) -> TyCon -> CtLoc -> Type -> [MagicTyFamResult]
-findRelevant f cmp_type loc = everything (++) $ mkQ [] findCmpType
+findRelevant
+  :: ([Type] -> TcPluginM (Maybe Type))
+  -> TyCon
+  -> CtLoc
+  -> Type
+  -> TcPluginM [MagicTyFamResult]
+findRelevant f familyTyCon loc =
+  everything (\x y -> (++) <$> x <*> y) $ mkQ (pure []) findFamilyType
   where
-    findCmpType t =
+    findFamilyType t =
       case splitTyConApp_maybe t of
-        Just (tc, ts) | tc == cmp_type ->
-           maybe [] (pure . MagicTyFamResult loc t) $ f ts
-        _ -> []
+        Just (tc, ts) | tc == familyTyCon ->
+           maybe [] (pure . MagicTyFamResult loc t) <$> f ts
+        _ -> pure []
 
 
 data MagicTyFamResult = MagicTyFamResult
@@ -180,4 +191,3 @@ type family WhenStuck (expr :: k) (b :: k) :: k where
   WhenStuck a                     b = a
 
 data AnythingOfAnyKind
-
